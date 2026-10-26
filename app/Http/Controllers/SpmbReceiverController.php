@@ -30,9 +30,26 @@ class SpmbReceiverController extends Controller
             return response()->json(['message' => 'Unauthorized — API key tidak cocok'], 401);
         }
 
+        // Timestamp wajib ada dan selisihnya maksimal ±300 detik dari jam
+        // server ini — sama seperti validasi di Portal Akademik asli.
+        $timestamp = (string) $request->header('X-Timestamp', '');
+
+        try {
+            $waktuKirim = \Illuminate\Support\Carbon::parse($timestamp);
+        } catch (\Throwable $e) {
+            $waktuKirim = null;
+        }
+
+        if ($timestamp === '' || !$waktuKirim || abs(now()->diffInSeconds($waktuKirim, false)) > 300) {
+            return response()->json(['message' => 'Unauthorized — X-Timestamp tidak valid atau di luar toleransi ±300 detik'], 401);
+        }
+
+        // Signature = HMAC-SHA256("{X-Timestamp}.{raw body}") — timestamp ikut
+        // ditandatangani supaya request lama tidak bisa di-replay dengan
+        // X-Timestamp baru.
         $rawBody = $request->getContent();
         $signature = (string) $request->header('X-Signature', '');
-        $expectedSignature = hash_hmac('sha256', $rawBody, (string) $secret);
+        $expectedSignature = hash_hmac('sha256', $timestamp.'.'.$rawBody, (string) $secret);
 
         if (empty($secret) || !hash_equals($expectedSignature, $signature)) {
             return response()->json(['message' => 'Unauthorized — signature tidak valid'], 401);
@@ -77,9 +94,12 @@ class SpmbReceiverController extends Controller
         $baris = now()->toDateTimeString()." — batch {$payload['batch_id']} — {$diterima} mahasiswa diterima\n";
         Storage::disk('local')->append('portal-demo/riwayat.log', $baris);
 
+        // Format ringkasan sama dengan Portal Akademik asli.
         return response()->json([
-            'message' => 'OK',
-            'diterima' => $diterima,
+            'batch_id' => $payload['batch_id'] ?? null,
+            'total' => count($mahasiswaList),
+            'berhasil' => $diterima,
+            'gagal' => count($mahasiswaList) - $diterima,
         ]);
     }
 

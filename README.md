@@ -53,14 +53,26 @@ gagal).
 | Header | Isi | Keterangan |
 |---|---|---|
 | `Authorization` | `Bearer <api_key>` | `api_key` = `SPMB_API_KEY` |
-| `X-Signature` | `hash_hmac('sha256', <raw body>, <hmac_secret>)` | Ditandatangani dari **body mentah**, bukan dari objek yang sudah di-decode |
-| `X-Timestamp` | ISO 8601, mis. `2026-10-05T08:05:50+07:00` | Informasi kapan dikirim; demo ini belum memakainya untuk validasi jendela waktu, tapi sistem asli sebaiknya menolak timestamp yang terlalu jauh dari waktu sekarang (replay-attack mitigation) |
+| `X-Signature` | `hash_hmac('sha256', <X-Timestamp> . '.' . <raw body>, <hmac_secret>)` | Yang ditandatangani: nilai header `X-Timestamp`, satu titik, lalu **body mentah** |
+| `X-Timestamp` | ISO 8601, mis. `2026-10-05T08:05:50+07:00` | Ikut ditandatangani. Penerima menolak `401` kalau selisihnya lebih dari ±300 detik dari jam server penerima |
 
-**Poin paling sering salah saat mengimplementasikan ulang:** signature harus
-dihitung dari string JSON **persis seperti yang dikirim di body**, sebelum
-di-parse. Kalau implementasi Anda men-decode JSON lalu meng-encode ulang
-untuk verifikasi, urutan key atau spasi bisa berubah dan signature akan
-selalu dianggap tidak valid walau datanya benar.
+Contoh string yang ditandatangani:
+
+```
+2026-10-05T08:05:50+07:00.{"schema_version":2,"batch_id":"20261005-080550",...}
+```
+
+**Poin paling sering salah saat mengimplementasikan ulang:**
+- Signature harus dihitung dari string JSON **persis seperti yang dikirim di
+  body**, sebelum di-parse. Kalau implementasi Anda men-decode JSON lalu
+  meng-encode ulang untuk verifikasi, urutan key atau spasi bisa berubah dan
+  signature akan selalu dianggap tidak valid walau datanya benar.
+- Pakai nilai `X-Timestamp` **apa adanya** (string mentah dari header) saat
+  menyusun string yang diverifikasi. Jangan di-parse lalu di-format ulang,
+  karena format zona waktu bisa berubah (mis. `+07:00` jadi `Z`).
+- Timestamp ikut ditandatangani supaya request lama tidak bisa dikirim ulang
+  (replay) dengan `X-Timestamp` baru. Pastikan jam server kedua pihak
+  sinkron NTP.
 
 ### Body (JSON)
 
@@ -92,20 +104,20 @@ array) — jangan asumsikan selalu 1 per request.
 
 ### Response yang diharapkan SPMB
 
-- `2xx` → SPMB menandai seluruh mahasiswa dalam batch itu **berhasil
-  terkirim**, tidak akan dikirim ulang otomatis lagi.
-- Selain `2xx` (termasuk timeout/connection error) → SPMB menandai **gagal**
-  dan akan otomatis mencoba lagi pada kiriman terjadwal berikutnya (atau bisa
-  dikirim ulang manual oleh admin).
-
-Contoh response sukses yang dipakai demo ini:
+Penerima membalas ringkasan per batch:
 
 ```json
-{ "message": "OK", "diterima": 1 }
+{ "batch_id": "20261005-080550", "total": 1, "berhasil": 1, "gagal": 0 }
 ```
 
-Bentuk body response di luar kode status tidak divalidasi SPMB — bebas sesuai
-kebutuhan Portal, asal kode status HTTP-nya benar.
+- `2xx` **dan** `gagal` = 0 **dan** `berhasil` = jumlah yang dikirim → SPMB
+  menandai seluruh mahasiswa dalam batch itu **berhasil terkirim**, tidak
+  akan dikirim ulang otomatis lagi.
+- Selain itu (kode non-2xx, timeout/connection error, atau `2xx` tapi ada
+  yang gagal) → SPMB menandai **seluruh batch gagal** dan otomatis mengirim
+  ulang semuanya pada jadwal berikutnya (atau bisa dikirim ulang manual oleh
+  admin). Ringkasan tidak menyebut NIM mana yang gagal, jadi yang sudah
+  berhasil ikut terkirim ulang — aman karena penerima meng-upsert per NIM.
 
 ---
 
@@ -149,16 +161,20 @@ Langkah konsepnya, lepas dari bahasa/framework yang dipakai tim Portal:
 
 1. Baca `Authorization` header, cocokkan token Bearer dengan API key yang
    disepakati. Tolak dengan `401` kalau tidak cocok.
-2. Baca **body mentah** (raw string, belum di-parse), hitung
-   `HMAC-SHA256(raw_body, hmac_secret)`, bandingkan dengan `X-Signature`
-   pakai perbandingan constant-time (`hash_equals` di PHP, `hmac.compare_digest`
-   di Python, dll — jangan pakai `==` biasa). Tolak `401` kalau tidak cocok.
-3. Baru setelah lolos keduanya, parse body sebagai JSON.
-4. Loop array `mahasiswa`, untuk tiap elemen: upsert berdasarkan `nim` ke
+2. Baca header `X-Timestamp`. Tolak `401` kalau kosong, tidak bisa dibaca
+   sebagai waktu, atau selisihnya lebih dari ±300 detik dari jam server.
+3. Baca **body mentah** (raw string, belum di-parse), hitung
+   `HMAC-SHA256(x_timestamp + "." + raw_body, hmac_secret)`, bandingkan dengan
+   `X-Signature` pakai perbandingan constant-time (`hash_equals` di PHP,
+   `hmac.compare_digest` di Python, dll — jangan pakai `==` biasa). Tolak
+   `401` kalau tidak cocok.
+4. Baru setelah lolos semuanya, parse body sebagai JSON.
+5. Loop array `mahasiswa`, untuk tiap elemen: upsert berdasarkan `nim` ke
    tabel mahasiswa Portal yang sebenarnya (bukan tabel demo seperti di sini).
-5. Balas `200`/`201` kalau semua berhasil disimpan. Kalau mau beri tahu SPMB
-   detail per-mahasiswa yang gagal secara granular, itu bisa didiskusikan
-   lagi — saat ini SPMB cuma membaca kode status HTTP di level batch.
+6. Balas `200` dengan ringkasan `{"batch_id","total","berhasil","gagal"}`.
+   SPMB menganggap batch berhasil hanya kalau kode `2xx`, `gagal` = 0, dan
+   `berhasil` sama dengan jumlah yang dikirim; selain itu seluruh batch
+   dikirim ulang nanti (aman karena upsert per NIM).
 
 ---
 
